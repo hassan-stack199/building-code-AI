@@ -1,0 +1,18 @@
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# Cached embeddings (will be regenerated)
+cache/
+*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
