@@ -47,7 +47,7 @@ CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 SHARED_INDEX_PATH = CACHE_DIR / "shared_index.pkl"
 
-CHAT_MODEL = "gemini-2.0-flash"
+CHAT_MODEL = "gemini-2.5-flash"
 EMBED_MODEL = "models/gemini-embedding-001"
 
 CHUNK_TOKENS = 900           # rough chunk size in characters / ~4 = tokens
