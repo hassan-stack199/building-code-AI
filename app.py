@@ -57,7 +57,7 @@ EMBED_MODEL = "models/gemini-embedding-001"
 
 CHUNK_TOKENS = 900           # rough chunk size in characters / ~4 = tokens
 CHUNK_OVERLAP = 150
-TOP_K = 6                    # retrieved chunks per query
+TOP_K = 12                   # retrieved chunks per query (more = better recall)
 MIN_RELEVANCE = 0.25         # cosine score below which we ALSO trigger a web
                              # search (chunks are always sent to the model)
 
@@ -238,6 +238,7 @@ def _files_signature(folder: Path) -> str:
 
 def _files_signature_v2(folder: Path) -> str:
     h = hashlib.sha256()
+    h.update(b"v3-2026-05-05")  # bump to force fresh re-index
     h.update(EMBED_MODEL_NAME.encode())
     if not folder.exists():
         return h.hexdigest()
@@ -353,26 +354,31 @@ def web_search_snippets(query: str, max_results: int = 4) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 SYSTEM_INSTRUCTION = (
-    "You are Building Code AI, an assistant that helps architects, engineers "
-    "and contractors find answers in building regulation documents.\n\n"
-    "RULES:\n"
-    "1. ALWAYS try to answer from the DOCUMENT CONTEXT first. The chunks given "
-    "to you are the most relevant excerpts from regulations the user has loaded. "
-    "Even if a chunk doesn't perfectly match the user's wording, look for "
-    "related provisions, definitions, tables, or clauses that could answer "
-    "the question.\n"
-    "2. When you cite a fact from the documents, write it inline like "
-    "(Source: <filename>, p.<page>). Use the exact filename and page number "
-    "shown in the context.\n"
-    "3. ONLY say 'I could not find this in the loaded documents.' if you have "
-    "carefully scanned ALL the provided chunks and none of them contain "
-    "anything related — direct or indirect — to the question. If you do say "
-    "this, then offer the web search results as a best-effort suggestion, "
-    "clearly labelled as 'from public web — verify against your official code'.\n"
-    "4. Never invent regulation numbers, clause numbers, or page numbers. If "
-    "you are unsure, say so.\n"
-    "5. Be concise and practical. Use short paragraphs and bullet lists when "
-    "they aid readability.\n"
+    "You are Building Code AI. The user is an architect/engineer asking about "
+    "building regulations. They have loaded specific PDF codes and you are "
+    "given the most relevant excerpts as DOCUMENT CONTEXT.\n\n"
+    "HOW TO ANSWER:\n"
+    "1. The chunks in DOCUMENT CONTEXT are the top semantic matches from the "
+    "user's loaded codes. They WILL contain partial or related information "
+    "even if no chunk literally repeats the user's words. Read every chunk "
+    "carefully and EXTRACT what's relevant. For example, if the user asks "
+    "about 'setback for a 20-floor building' and a chunk talks about "
+    "'minimum boundary distance for buildings above 30m', that IS the answer "
+    "— synthesise it.\n"
+    "2. Cite the source for every fact you use, like "
+    "(Source: <filename>, p.<page>). Use the EXACT filename and page shown "
+    "in each chunk's header.\n"
+    "3. NEVER say 'I could not find this in the loaded documents' unless the "
+    "chunks are entirely about an unrelated subject. If chunks contain "
+    "ANY relevant tables, clauses, definitions, or numerical values, USE THEM.\n"
+    "4. If chunks are partially relevant but incomplete, give the user what "
+    "you can extract, then add a note like: 'For the full table / clause, "
+    "see <filename> page X.'\n"
+    "5. Only fall back to the web search results if NOTHING in the chunks is "
+    "relevant. Mark web results clearly as 'public web — verify against your "
+    "official code'.\n"
+    "6. Never invent regulation numbers or page numbers.\n"
+    "7. Be concise and practical.\n"
 )
 
 
@@ -566,6 +572,13 @@ def render_messages(chat: dict) -> None:
     for m in chat["messages"]:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
+            if m["role"] == "assistant":
+                hits_count = len(m.get("hits") or [])
+                top_score = (m["hits"][0][0] if hits_count else 0.0)
+                st.caption(
+                    f"_Retrieved {hits_count} chunks; top relevance "
+                    f"{top_score:.2f}_"
+                )
             if m["role"] == "assistant" and m.get("hits"):
                 with st.expander("Show retrieved excerpts"):
                     for score, ch in m["hits"]:
