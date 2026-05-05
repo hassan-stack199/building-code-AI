@@ -605,11 +605,26 @@ def main() -> None:
         )
         st.stop()
 
+    # Render the title FIRST so the user sees something while indexing.
+    st.markdown(f"## 🏗️ {APP_TITLE}")
+    st.caption(APP_TAGLINE)
+
+    # Pre-warm the shared library index in the main panel so progress is visible.
+    if "shared_index_ready" not in st.session_state:
+        with st.status(
+            "Indexing your regulation PDFs for the first time… "
+            "(can take a few minutes for large documents — only happens once)",
+            expanded=True,
+        ) as status:
+            load_shared_index()
+            status.update(
+                label="Indexing complete.", state="complete", expanded=False
+            )
+        st.session_state["shared_index_ready"] = True
+
     render_sidebar()
 
     chat = get_active_chat()
-    st.markdown(f"## 🏗️ {APP_TITLE}")
-    st.caption(APP_TAGLINE)
 
     render_messages(chat)
 

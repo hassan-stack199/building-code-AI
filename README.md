@@ -1,3 +1,13 @@
+---
+title: Building Code AI
+emoji: 🏗️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Building Code AI
 
 A free, shareable web app for asking questions about building regulation PDFs.
