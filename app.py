@@ -32,7 +32,12 @@ import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 
+import sys
 import google.generativeai as genai
+
+
+def _log(msg: str) -> None:
+    print(f"[bca] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +58,7 @@ EMBED_MODEL = "models/gemini-embedding-001"
 CHUNK_TOKENS = 900           # rough chunk size in characters / ~4 = tokens
 CHUNK_OVERLAP = 150
 TOP_K = 6                    # retrieved chunks per query
-MIN_RELEVANCE = 0.55         # cosine score below which we treat the
+MIN_RELEVANCE = 0.40         # cosine score below which we treat the
                              # library as "no answer found"
 
 
@@ -157,85 +162,59 @@ def extract_chunks_from_pdf(file_like, source_label: str) -> list[Chunk]:
 
 
 # ---------------------------------------------------------------------------
-# Embeddings
+# Index — local semantic embeddings via fastembed (no API rate limits)
 # ---------------------------------------------------------------------------
 
-def _embed_texts(texts: list[str], task: str) -> list[np.ndarray]:
-    """Embed a batch of strings via Gemini. Returns one numpy vector per text."""
-    out: list[np.ndarray] = []
-    # Gemini's embed_content accepts batches; chunk to be safe.
-    BATCH = 50
-    for i in range(0, len(texts), BATCH):
-        batch = texts[i : i + BATCH]
-        # Retry on transient errors
-        last_err: Exception | None = None
-        for attempt in range(4):
-            try:
-                resp = genai.embed_content(
-                    model=EMBED_MODEL,
-                    content=batch,
-                    task_type=task,
-                )
-                vectors = resp["embedding"]
-                # If a single string was passed, embedding is a flat list;
-                # for batches it's a list of lists.
-                if vectors and isinstance(vectors[0], (int, float)):
-                    vectors = [vectors]
-                for v in vectors:
-                    out.append(np.array(v, dtype=np.float32))
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                time.sleep(1.5 * (attempt + 1))
-        else:
-            raise RuntimeError(f"Embedding call failed: {last_err}")
-    return out
+from fastembed import TextEmbedding
+
+# Small, fast, semantic. ~130MB download on first run; cached to disk after.
+EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+_embed_cache = {"model": None}
 
 
-def embed_chunks(chunks: list[Chunk]) -> None:
-    """Mutate chunks in place, attaching .embedding."""
-    if not chunks:
-        return
-    texts = [c.text for c in chunks]
-    vectors = _embed_texts(texts, task="retrieval_document")
-    for c, v in zip(chunks, vectors):
-        c.embedding = v
+def _get_embedder() -> TextEmbedding:
+    if _embed_cache["model"] is None:
+        _log(f"Loading embedding model {EMBED_MODEL_NAME} (first time only)…")
+        _embed_cache["model"] = TextEmbedding(model_name=EMBED_MODEL_NAME)
+        _log("Embedding model loaded.")
+    return _embed_cache["model"]
 
 
-def embed_query(query: str) -> np.ndarray:
-    return _embed_texts([query], task="retrieval_query")[0]
+def _embed_texts(texts: list[str]) -> np.ndarray:
+    embedder = _get_embedder()
+    vectors = list(embedder.embed(texts))
+    return np.stack(vectors).astype(np.float32)
 
-
-# ---------------------------------------------------------------------------
-# Index: in-memory vector store with cosine similarity
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Index:
     chunks: list[Chunk] = field(default_factory=list)
-    matrix: np.ndarray | None = None   # (N, D) normalized
+    matrix: np.ndarray | None = None  # (N, D) normalized
 
-    def rebuild_matrix(self) -> None:
-        if not self.chunks:
-            self.matrix = None
-            return
-        m = np.stack([c.embedding for c in self.chunks])
+    def _normalize(self, m: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(m, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        self.matrix = m / norms
+        return m / norms
 
     def add(self, new_chunks: list[Chunk]) -> None:
+        if not new_chunks:
+            return
+        vectors = _embed_texts([c.text for c in new_chunks])
+        for c, v in zip(new_chunks, vectors):
+            c.embedding = v
         self.chunks.extend(new_chunks)
-        self.rebuild_matrix()
+        m = np.stack([c.embedding for c in self.chunks])
+        self.matrix = self._normalize(m)
 
     def sources(self) -> list[str]:
         return sorted({c.source for c in self.chunks})
 
-    def search(self, query_vec: np.ndarray, k: int = TOP_K) -> list[tuple[float, Chunk]]:
-        if self.matrix is None or len(self.chunks) == 0:
+    def search(self, query: str, k: int = 6) -> list[tuple[float, Chunk]]:
+        if self.matrix is None or not self.chunks:
             return []
-        qn = query_vec / (np.linalg.norm(query_vec) or 1.0)
-        scores = self.matrix @ qn
+        qv = _embed_texts([query])[0]
+        qv = qv / (np.linalg.norm(qv) or 1.0)
+        scores = self.matrix @ qv
         top_idx = np.argsort(-scores)[:k]
         return [(float(scores[i]), self.chunks[i]) for i in top_idx]
 
@@ -257,24 +236,36 @@ def _files_signature(folder: Path) -> str:
     return h.hexdigest()
 
 
+def _files_signature_v2(folder: Path) -> str:
+    h = hashlib.sha256()
+    h.update(EMBED_MODEL_NAME.encode())
+    if not folder.exists():
+        return h.hexdigest()
+    for p_ in sorted(folder.glob("*.pdf")):
+        s = p_.stat()
+        h.update(p_.name.encode())
+        h.update(str(s.st_size).encode())
+    return h.hexdigest()
+
+
 @st.cache_resource(show_spinner=False)
 def load_shared_index() -> Index:
-    """Build (or load from cache) the index over the shared regulations folder."""
-    signature = _files_signature(REGULATIONS_DIR)
+    """Build (or load from cache) the embedding index over shared PDFs."""
+    sig = _files_signature_v2(REGULATIONS_DIR)
+    cache_file = CACHE_DIR / f"index_{sig[:12]}.pkl"
 
-    # Try cache first
-    if SHARED_INDEX_PATH.exists():
+    if cache_file.exists():
         try:
-            with open(SHARED_INDEX_PATH, "rb") as f:
+            _log(f"Loading cached index from {cache_file.name}")
+            with open(cache_file, "rb") as f:
                 payload = pickle.load(f)
-            if payload.get("signature") == signature:
-                idx = Index(chunks=payload["chunks"])
-                idx.rebuild_matrix()
-                return idx
-        except Exception:
-            pass
+            idx = Index(chunks=payload["chunks"])
+            idx.matrix = payload["matrix"]
+            _log(f"Cache hit: {len(idx.chunks)} chunks loaded.")
+            return idx
+        except Exception as e:
+            _log(f"Cache load failed: {e}; rebuilding")
 
-    # Build fresh
     idx = Index()
     if not REGULATIONS_DIR.exists():
         return idx
@@ -282,31 +273,31 @@ def load_shared_index() -> Index:
     if not pdfs:
         return idx
 
-    progress = st.progress(0.0, text="Indexing shared regulations…")
+    progress = st.progress(0.0, text="Reading regulation PDFs…")
     all_chunks: list[Chunk] = []
     for i, pdf_path in enumerate(pdfs):
+        _log(f"Reading PDF {i+1}/{len(pdfs)}: {pdf_path.name}")
         progress.progress(
             i / max(len(pdfs), 1),
             text=f"Reading {pdf_path.name}…",
         )
         with open(pdf_path, "rb") as fh:
             file_chunks = extract_chunks_from_pdf(fh, source_label=pdf_path.name)
-        try:
-            embed_chunks(file_chunks)
-        except Exception as e:  # noqa: BLE001
-            st.warning(f"Could not embed {pdf_path.name}: {e}")
-            continue
         all_chunks.extend(file_chunks)
+        _log(f"  -> {pdf_path.name}: {len(file_chunks)} chunks")
+    progress.progress(0.5, text=f"Embedding {len(all_chunks)} chunks…")
+    _log(f"Embedding {len(all_chunks)} chunks…")
+    idx.add(all_chunks)
+    _log("Index built.")
     progress.empty()
 
-    idx.add(all_chunks)
-
-    # Persist
     try:
-        with open(SHARED_INDEX_PATH, "wb") as f:
-            pickle.dump({"signature": signature, "chunks": idx.chunks}, f)
-    except Exception:
-        pass
+        with open(cache_file, "wb") as f:
+            pickle.dump({"chunks": idx.chunks, "matrix": idx.matrix}, f)
+        _log(f"Cached to {cache_file.name}")
+    except Exception as e:
+        _log(f"Cache save failed: {e}")
+
     return idx
 
 
@@ -326,7 +317,6 @@ def ingest_uploaded_file(uploaded) -> int:
     chunks = extract_chunks_from_pdf(io.BytesIO(uploaded.getvalue()), label)
     if not chunks:
         return 0
-    embed_chunks(chunks)
     get_personal_index().add(chunks)
     return len(chunks)
 
@@ -336,9 +326,8 @@ def ingest_uploaded_file(uploaded) -> int:
 # ---------------------------------------------------------------------------
 
 def retrieve(query: str, k: int = TOP_K) -> list[tuple[float, Chunk]]:
-    qv = embed_query(query)
-    shared = load_shared_index().search(qv, k=k)
-    personal = get_personal_index().search(qv, k=k)
+    shared = load_shared_index().search(query, k=k)
+    personal = get_personal_index().search(query, k=k)
     merged = sorted(shared + personal, key=lambda x: -x[0])[:k]
     return merged
 
@@ -611,16 +600,28 @@ def main() -> None:
 
     # Pre-warm the shared library index in the main panel so progress is visible.
     if "shared_index_ready" not in st.session_state:
+        _log("Pre-warming shared index from main()")
         with st.status(
             "Indexing your regulation PDFs for the first time… "
-            "(can take a few minutes for large documents — only happens once)",
+            "(can take 10+ minutes for large documents — only happens once)",
             expanded=True,
         ) as status:
-            load_shared_index()
-            status.update(
-                label="Indexing complete.", state="complete", expanded=False
-            )
-        st.session_state["shared_index_ready"] = True
+            try:
+                load_shared_index()
+                status.update(
+                    label="Indexing complete.", state="complete", expanded=False
+                )
+                st.session_state["shared_index_ready"] = True
+            except Exception as e:
+                _log(f"Indexing failed: {e}")
+                status.update(
+                    label=f"Indexing failed: {e}", state="error", expanded=True,
+                )
+                st.error(
+                    f"The PDF indexing failed. You can still chat — answers "
+                    f"will fall back to web search.\n\nError: `{e}`"
+                )
+                st.session_state["shared_index_ready"] = True  # don't retry
 
     render_sidebar()
 
