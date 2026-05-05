@@ -58,8 +58,8 @@ EMBED_MODEL = "models/gemini-embedding-001"
 CHUNK_TOKENS = 900           # rough chunk size in characters / ~4 = tokens
 CHUNK_OVERLAP = 150
 TOP_K = 6                    # retrieved chunks per query
-MIN_RELEVANCE = 0.40         # cosine score below which we treat the
-                             # library as "no answer found"
+MIN_RELEVANCE = 0.25         # cosine score below which we ALSO trigger a web
+                             # search (chunks are always sent to the model)
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +339,11 @@ def retrieve(query: str, k: int = TOP_K) -> list[tuple[float, Chunk]]:
 def web_search_snippets(query: str, max_results: int = 4) -> list[dict]:
     try:
         from duckduckgo_search import DDGS
+        # Add architectural-context terms so DDG doesn't interpret terms like
+        # "setback" or "loading" in their everyday English sense.
+        prefixed = f"building code regulation {query}"
         with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=max_results)) or []
+            return list(ddgs.text(prefixed, max_results=max_results)) or []
     except Exception:
         return []
 
@@ -353,15 +356,19 @@ SYSTEM_INSTRUCTION = (
     "You are Building Code AI, an assistant that helps architects, engineers "
     "and contractors find answers in building regulation documents.\n\n"
     "RULES:\n"
-    "1. ALWAYS prefer the document context provided to you over general knowledge.\n"
-    "2. When you use a fact from the documents, cite it inline like "
-    "(Source: <filename>, p.<page>). Use the exact filename and page numbers "
-    "given in the context blocks.\n"
-    "3. If the answer is not in the provided context, say so clearly with the "
-    "phrase: 'I could not find this in the loaded documents.' Then, if web "
-    "search results are also provided, you may offer them as a best-effort "
-    "suggestion — but make it explicit that this is from the public web and "
-    "should be verified against the official code that applies to the user.\n"
+    "1. ALWAYS try to answer from the DOCUMENT CONTEXT first. The chunks given "
+    "to you are the most relevant excerpts from regulations the user has loaded. "
+    "Even if a chunk doesn't perfectly match the user's wording, look for "
+    "related provisions, definitions, tables, or clauses that could answer "
+    "the question.\n"
+    "2. When you cite a fact from the documents, write it inline like "
+    "(Source: <filename>, p.<page>). Use the exact filename and page number "
+    "shown in the context.\n"
+    "3. ONLY say 'I could not find this in the loaded documents.' if you have "
+    "carefully scanned ALL the provided chunks and none of them contain "
+    "anything related — direct or indirect — to the question. If you do say "
+    "this, then offer the web search results as a best-effort suggestion, "
+    "clearly labelled as 'from public web — verify against your official code'.\n"
     "4. Never invent regulation numbers, clause numbers, or page numbers. If "
     "you are unsure, say so.\n"
     "5. Be concise and practical. Use short paragraphs and bullet lists when "
