@@ -52,7 +52,7 @@ CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 SHARED_INDEX_PATH = CACHE_DIR / "shared_index.pkl"
 
-CHAT_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-2.5-flash-lite"
 EMBED_MODEL = "models/gemini-embedding-001"
 
 CHUNK_TOKENS = 900           # rough chunk size in characters / ~4 = tokens
@@ -180,10 +180,18 @@ def _get_embedder() -> TextEmbedding:
     return _embed_cache["model"]
 
 
-def _embed_texts(texts: list[str]) -> np.ndarray:
+def _embed_texts(texts: list[str], batch_size: int = 64) -> np.ndarray:
+    """Embed in small batches to keep peak memory low (matters during Docker build)."""
     embedder = _get_embedder()
-    vectors = list(embedder.embed(texts))
-    return np.stack(vectors).astype(np.float32)
+    out = []
+    total = len(texts)
+    for i in range(0, total, batch_size):
+        batch = texts[i : i + batch_size]
+        vecs = list(embedder.embed(batch))
+        out.extend(vecs)
+        if (i // batch_size) % 10 == 0 and total > batch_size:
+            _log(f"  Embedded {min(i + batch_size, total)}/{total}")
+    return np.stack(out).astype(np.float32)
 
 
 @dataclass
@@ -354,31 +362,53 @@ def web_search_snippets(query: str, max_results: int = 4) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 SYSTEM_INSTRUCTION = (
-    "You are Building Code AI. The user is an architect/engineer asking about "
-    "building regulations. They have loaded specific PDF codes and you are "
-    "given the most relevant excerpts as DOCUMENT CONTEXT.\n\n"
-    "HOW TO ANSWER:\n"
-    "1. The chunks in DOCUMENT CONTEXT are the top semantic matches from the "
-    "user's loaded codes. They WILL contain partial or related information "
-    "even if no chunk literally repeats the user's words. Read every chunk "
-    "carefully and EXTRACT what's relevant. For example, if the user asks "
-    "about 'setback for a 20-floor building' and a chunk talks about "
-    "'minimum boundary distance for buildings above 30m', that IS the answer "
-    "— synthesise it.\n"
-    "2. Cite the source for every fact you use, like "
-    "(Source: <filename>, p.<page>). Use the EXACT filename and page shown "
-    "in each chunk's header.\n"
-    "3. NEVER say 'I could not find this in the loaded documents' unless the "
-    "chunks are entirely about an unrelated subject. If chunks contain "
-    "ANY relevant tables, clauses, definitions, or numerical values, USE THEM.\n"
-    "4. If chunks are partially relevant but incomplete, give the user what "
-    "you can extract, then add a note like: 'For the full table / clause, "
-    "see <filename> page X.'\n"
-    "5. Only fall back to the web search results if NOTHING in the chunks is "
-    "relevant. Mark web results clearly as 'public web — verify against your "
-    "official code'.\n"
-    "6. Never invent regulation numbers or page numbers.\n"
-    "7. Be concise and practical.\n"
+    "You are Building Code AI. You help architects and engineers in TWO ways:\n"
+    "  (1) DESIGN HELPER — when the user describes a real design situation "
+    "with numbers/constraints (e.g. 'ramp for 1.5m height', 'parking for 40 "
+    "cars', 'fire stair for 12-storey building'), you produce a worked "
+    "design recommendation AND cite the code clauses governing it.\n"
+    "  (2) CODE LOOKUP — when the user asks a general or factual question "
+    "about regulations (e.g. 'what is the minimum setback' / 'what does the "
+    "code say about <X>'), you just retrieve the relevant clauses.\n\n"
+    "You receive: DOCUMENT CONTEXT (top semantic chunks from the user's "
+    "loaded codes) and WEB SEARCH RESULTS.\n\n"
+    "STEP 1 — Decide the mode (do this silently, do not state it):\n"
+    "  - DESIGN HELPER if the user describes their own project with numbers "
+    "or measurable constraints.\n"
+    "  - CODE LOOKUP otherwise.\n\n"
+    "STEP 2 — If DESIGN HELPER and CRITICAL details are missing for a "
+    "correct answer (e.g. ramp without knowing accessibility vs service; "
+    "stair without knowing public vs private; parking without knowing "
+    "use class), STOP and ask ONE short clarifying question. Do not guess. "
+    "Do not produce Part A/B/C yet — just the question.\n\n"
+    "STEP 3 — Answer in this format:\n\n"
+    "**FOR DESIGN HELPER questions, use three sections:**\n\n"
+    "**A. Design recommendation**\n"
+    "Worked answer with numbers. Show the calculation briefly so the user "
+    "can verify. Example: 'Ramp slope @ 1:12 → required run = 1.5 m × 12 = "
+    "18 m. Add a 1.5 m × 1.5 m landing every 9 m.' Use SI units (metres, "
+    "millimetres) unless the code uses imperial.\n\n"
+    "**B. Code reference**\n"
+    "Cite the exact clause(s) from DOCUMENT CONTEXT that govern the "
+    "numbers in Part A. Format every citation as (Source: <filename>, "
+    "p.<page>). If a chunk only partly matches, summarise what it says "
+    "and add 'See full clause: <filename> p.X'. Never invent numbers. "
+    "If no chunk is relevant, say 'No matching clause found in your "
+    "loaded codes — verify before construction.'\n\n"
+    "**C. Web reference (for comparison)**\n"
+    "2 lines max from WEB SEARCH RESULTS + one markdown link "
+    "[Source name](URL). If web results are irrelevant, write only "
+    "'No useful web reference found.' No extra disclaimers.\n\n"
+    "**FOR CODE LOOKUP questions, use two sections only (skip Part A):**\n\n"
+    "**Code reference**\n"
+    "Same as Part B above.\n\n"
+    "**Web reference (for comparison)**\n"
+    "Same as Part C above.\n\n"
+    "GENERAL RULES:\n"
+    "- Never invent regulation numbers, page numbers, or clauses.\n"
+    "- Be concise and practical.\n"
+    "- If chunks are partly relevant, EXTRACT what's useful, don't say "
+    "'not found'.\n"
 )
 
 
@@ -411,9 +441,8 @@ def answer_question(
     """Run the RAG pipeline. Returns (answer, hits, web_snippets)."""
     hits = retrieve(question, k=TOP_K)
     best_score = hits[0][0] if hits else 0.0
-    web_snippets: list[dict] = []
-    if best_score < MIN_RELEVANCE:
-        web_snippets = web_search_snippets(question)
+    # Always run a quick web search so we can show a "for comparison" footer.
+    web_snippets = web_search_snippets(question, max_results=3)
 
     context_block = build_context_block(hits)
     web_block = build_web_block(web_snippets)
@@ -620,28 +649,45 @@ def main() -> None:
 
     # Pre-warm the shared library index in the main panel so progress is visible.
     if "shared_index_ready" not in st.session_state:
-        _log("Pre-warming shared index from main()")
-        with st.status(
-            "Indexing your regulation PDFs for the first time… "
-            "(can take 10+ minutes for large documents — only happens once)",
-            expanded=True,
-        ) as status:
+        # If a baked-in / on-disk cache exists, load is essentially instant —
+        # don't show the noisy status box. Only show it on a true cold build.
+        sig = _files_signature_v2(REGULATIONS_DIR)
+        cache_file = CACHE_DIR / f"index_{sig[:12]}.pkl"
+        if cache_file.exists():
             try:
-                load_shared_index()
-                status.update(
-                    label="Indexing complete.", state="complete", expanded=False
-                )
+                load_shared_index()  # instant from pickle
                 st.session_state["shared_index_ready"] = True
             except Exception as e:
-                _log(f"Indexing failed: {e}")
-                status.update(
-                    label=f"Indexing failed: {e}", state="error", expanded=True,
-                )
-                st.error(
-                    f"The PDF indexing failed. You can still chat — answers "
-                    f"will fall back to web search.\n\nError: `{e}`"
-                )
-                st.session_state["shared_index_ready"] = True  # don't retry
+                _log(f"Cached index load failed: {e}")
+                st.session_state["shared_index_ready"] = True
+        else:
+            _log("Pre-warming shared index from main()")
+            with st.status(
+                "Indexing your regulation PDFs for the first time… "
+                "(only happens once)",
+                expanded=True,
+            ) as status:
+                try:
+                    load_shared_index()
+                    status.update(
+                        label="Indexing complete.",
+                        state="complete",
+                        expanded=False,
+                    )
+                    st.session_state["shared_index_ready"] = True
+                except Exception as e:
+                    _log(f"Indexing failed: {e}")
+                    status.update(
+                        label=f"Indexing failed: {e}",
+                        state="error",
+                        expanded=True,
+                    )
+                    st.error(
+                        f"The PDF indexing failed. You can still chat — "
+                        f"answers will fall back to web search.\n\n"
+                        f"Error: `{e}`"
+                    )
+                    st.session_state["shared_index_ready"] = True
 
     render_sidebar()
 

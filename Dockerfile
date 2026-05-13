@@ -2,27 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps (none beyond base; pypdf is pure python)
 RUN pip install --no-cache-dir --upgrade pip
 
 # Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
+# App code (PDFs, app.py, build_index.py, etc.)
 COPY . .
 
-# HF Spaces requires non-root user with UID 1000
-RUN useradd -m -u 1000 user && \
-    mkdir -p /app/cache && \
-    chown -R user:user /app
-USER user
+# Force fastembed/HF caches to live INSIDE /app so they get baked into the
+# image and survive container restarts.
+ENV HF_HOME=/app/.cache/huggingface
+ENV FASTEMBED_CACHE_PATH=/app/.cache/fastembed
+ENV HOME=/app
 
-EXPOSE 7860
-
-CMD ["streamlit", "run", "app.py", \
-     "--server.port=7860", \
-     "--server.address=0.0.0.0", \
-     "--server.headless=true", \
-     "--server.enableCORS=false", \
-     "--server.enableXsrfProtection=false"]
+# Pre-build the embedding index at IMAGE BUILD TIME so the container starts
+# with everything ready. Downloads the embedding model AND embeds every
+# chunk in ./regulations/. Result 
